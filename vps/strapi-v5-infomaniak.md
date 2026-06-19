@@ -272,3 +272,94 @@ sudo nginx -t
 # Renouveler le certificat SSL manuellement
 sudo certbot renew
 ```
+
+## 13. CI/CD avec GitHub Actions
+ 
+Le build se fait sur les runners GitHub (pas sur le VPS) pour éviter les problèmes de mémoire.
+ 
+### Créer une clé SSH dédiée
+ 
+Sur la machine locale :
+ 
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_github_actions -C "github-actions" -N ""
+```
+ 
+Ajouter la clé publique au VPS :
+ 
+```bash
+cat ~/.ssh/id_github_actions.pub
+# Puis sur le VPS :
+echo "la-clé-publique" >> ~/.ssh/authorized_keys
+```
+ 
+### Ajouter les secrets GitHub
+ 
+Dans le repo GitHub → Settings → Secrets and variables → Actions, ajouter :
+ 
+- `VPS_SSH_KEY` : contenu complet de `~/.ssh/id_github_actions` (clé privée)
+- `VPS_HOST` : IP du VPS
+- `VPS_USER` : `ubuntu`
+- `APP_KEYS` : valeur du .env local
+- `API_TOKEN_SALT` : valeur du .env local
+- `ADMIN_JWT_SECRET` : valeur du .env local
+- `TRANSFER_TOKEN_SALT` : valeur du .env local
+- `JWT_SECRET` : valeur du .env local
+### Créer le workflow
+ 
+```bash
+mkdir -p .github/workflows
+nano .github/workflows/deploy.yml
+```
+ 
+```yaml
+name: Deploy to VPS
+ 
+on:
+  push:
+    branches:
+      - main
+ 
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+ 
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+ 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+ 
+      - name: Install dependencies
+        run: npm install
+ 
+      - name: Build Strapi
+        run: npm run build
+        env:
+          NODE_ENV: production
+          APP_KEYS: ${{ secrets.APP_KEYS }}
+          API_TOKEN_SALT: ${{ secrets.API_TOKEN_SALT }}
+          ADMIN_JWT_SECRET: ${{ secrets.ADMIN_JWT_SECRET }}
+          TRANSFER_TOKEN_SALT: ${{ secrets.TRANSFER_TOKEN_SALT }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+ 
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+            cd ~/nom-du-repo
+            git pull origin main
+            npm install --production
+            pm2 restart strapi
+```
+ 
+> Le build se fait sur la machine GitHub — le VPS ne fait que récupérer le code et redémarrer PM2.
+> nvm doit être chargé explicitement dans le script SSH car la session est non-interactive.
