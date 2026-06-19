@@ -1,176 +1,102 @@
-# Runbook — Déploiement Strapi v5 sur VPS Infomaniak
+# Héberger Strapi v5 sur un VPS Linux
 
-## Contexte
+## Stack
 
-- **Projet** : Classe moyenne éditions
-- **CMS** : Strapi v5 (migré depuis v3)
-- **Hébergeur** : Infomaniak VPS Lite
-- **Domaine Strapi** : strapi.cmeditions.fr
-- **Médias** : Cloudinary (pas de gestion locale des fichiers)
+- **OS** : Ubuntu 24.04 LTS
+- **Runtime** : Node.js 22 LTS (via nvm)
 - **Base de données** : PostgreSQL
+- **Process manager** : PM2
+- **Reverse proxy** : Nginx
+- **SSL** : Let's Encrypt (Certbot)
 
 ---
 
-## Prérequis locaux
-
-- Node.js via nvm
-- Git + GitHub CLI (`gh`)
-- Heroku CLI (pour dump de la base source)
-- PostgreSQL 17 en local (pour restaurer le dump)
-
----
-
-## 1. Récupérer la base de données source (Heroku)
+## 1. Connexion au VPS
 
 ```bash
-heroku pg:backups:capture --app nom-de-lapp
-heroku pg:backups:download --app nom-de-lapp
-# Génère un fichier latest.dump
-
-createdb nom-db-locale
-pg_restore --no-owner --no-privileges -d nom-db-locale latest.dump
+ssh -i ~/.ssh/ma-cle ubuntu@IP_DU_VPS
 ```
-
-> Si erreur de version pg_restore : installer PostgreSQL 17 via Homebrew et l'ajouter au PATH.
 
 ---
 
-## 2. Migration Strapi v3 → v5
-
-Effectuée via Claude Code. Résultat : une app Strapi v5 fraîche avec les données migrées.
-
-### Transfer des données (v5 local → v5 VPS)
-
-```bash
-# Depuis le dossier du projet Strapi v5 local
-npm run strapi transfer -- --to https://strapi.cmeditions.fr/admin
-```
-
-> Générer un token de transfer dans l'admin Strapi du VPS avant de lancer.
-> Les assets échoueront (Cloudinary gère les médias) — les entités passeront.
-
----
-
-## 3. Migration API REST → GraphQL (frontend Next.js)
-
-### Installer le plugin GraphQL sur Strapi v5
-
-```bash
-npm install @strapi/plugin-graphql
-```
-
-Déclarer dans `config/plugins.ts` :
-
-```typescript
-graphql: {
-  enabled: true,
-}
-```
-
-### Réécrire utils/api.js
-
-Remplacer les appels REST par GraphQL via une fonction `fetchGraphQL` :
-
-```javascript
-const GRAPHQL_URL = `${process.env.NEXT_PUBLIC_STRAPI_API_URL}/graphql`
-
-async function fetchGraphQL(query, variables = {}) {
-  const response = await fetch(GRAPHQL_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
-  })
-  const data = await response.json()
-  return data.data
-}
-```
-
-> En Strapi v5, pas de `data.attributes` — les champs sont directement à plat.
-> Utiliser `documentId` à la place de `id` numérique.
-> Ajouter `pagination: { pageSize: 100 }` pour éviter la limite de 10 résultats par défaut.
-
----
-
-## 4. Provisionner le VPS
-
-### Connexion SSH
-
-```bash
-ssh -i ~/.ssh/id_infomaniak ubuntu@IP_DU_VPS
-```
-
-### Mise à jour du système
+## 2. Mise à jour du système
 
 ```bash
 sudo apt update && sudo apt upgrade -y
 ```
 
-### Installer nvm
+---
+
+## 3. Installer nvm et Node.js
 
 ```bash
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name"' | cut -d'"' -f4)/install.sh | bash
 source ~/.bashrc
-nvm --version
-```
 
-### Installer Node.js 22 LTS
-
-```bash
 nvm install 22
 nvm alias default 22
 node --version
 ```
 
-### Installer PostgreSQL
+> Strapi v5 supporte Node.js v20, v22 et v24 (LTS uniquement).
+
+---
+
+## 4. Installer PostgreSQL
 
 ```bash
 sudo apt install postgresql postgresql-contrib -y
 sudo systemctl status postgresql
 ```
 
-### Créer la base de données et l'utilisateur
+### Créer un utilisateur et une base de données
 
 ```bash
 sudo -u postgres psql
 ```
 
 ```sql
-CREATE USER strapi WITH PASSWORD 'mot-de-passe-solide';
-CREATE DATABASE strapi_cme OWNER strapi;
+CREATE USER mon_user WITH PASSWORD 'mot-de-passe';
+CREATE DATABASE ma_db OWNER mon_user;
 \q
 ```
 
-> Eviter les caractères spéciaux dans le mot de passe (problèmes d'échappement dans le .env).
+> Éviter les caractères spéciaux dans le mot de passe — ils peuvent causer des problèmes d'échappement dans le .env.
 
-### Installer PM2
+---
+
+## 5. Installer PM2 et Nginx
 
 ```bash
 npm install -g pm2
-```
-
-### Installer Nginx
-
-```bash
 sudo apt install nginx -y
-sudo systemctl status nginx
 ```
 
 ---
 
-## 5. Déployer Strapi sur le VPS
+## 6. Ajouter un swap (recommandé si RAM ≤ 2 Go)
 
-### Pousser le code sur GitHub
+Le build Strapi est gourmand en mémoire. Un swap évite les erreurs out of memory.
 
 ```bash
-git remote set-url origin https://github.com/user/repo.git
-git push -u origin main
+sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# Rendre le swap permanent
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 ```
 
-### Cloner sur le VPS
+---
+
+## 7. Déployer Strapi
+
+### Cloner le repo
 
 ```bash
 git clone https://github.com/user/repo.git
-cd nom-du-repo
+cd repo
 npm install
 ```
 
@@ -192,20 +118,12 @@ JWT_SECRET=...
 DATABASE_CLIENT=postgres
 DATABASE_HOST=127.0.0.1
 DATABASE_PORT=5432
-DATABASE_NAME=strapi_cme
-DATABASE_USERNAME=strapi
-DATABASE_PASSWORD=mot-de-passe-solide
-
-CLOUDINARY_NAME=...
-CLOUDINARY_API_KEY=...
-CLOUDINARY_API_SECRET=...
-
-SMTP_HOST=pro1.mail.ovh.net
-SMTP_PORT=587
-SMTP_USERNAME=adresse@domaine.fr
-SMTP_PASSWORD=mot-de-passe-email
-SMTP_FROM=adresse@domaine.fr
+DATABASE_NAME=ma_db
+DATABASE_USERNAME=mon_user
+DATABASE_PASSWORD=mot-de-passe
 ```
+
+> Les valeurs APP_KEYS, secrets et salts se trouvent dans le .env local du projet.
 
 ### Builder Strapi
 
@@ -213,48 +131,28 @@ SMTP_FROM=adresse@domaine.fr
 NODE_ENV=production NODE_OPTIONS="--max-old-space-size=1536" npm run build
 ```
 
-> Le build peut prendre 5-10 minutes sur un VPS avec 2 Go de RAM.
-> Si erreur out of memory : ajouter un swap de 2 Go (voir section Swap).
+> Le build peut prendre plusieurs minutes sur un petit VPS.
 
 ### Démarrer avec PM2
 
 ```bash
-NODE_ENV=production pm2 start npm --name "strapi-cme" -- start
+NODE_ENV=production pm2 start npm --name "strapi" -- start
 pm2 startup
 pm2 save
 ```
 
 ---
 
-## 6. Ajouter un swap (si out of memory au build)
+## 8. Configurer Nginx comme reverse proxy
 
 ```bash
-sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-```
-
-Pour rendre le swap permanent au reboot :
-
-```bash
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-```
-
----
-
-## 7. Configurer Nginx
-
-### Créer la configuration
-
-```bash
-sudo nano /etc/nginx/sites-available/strapi-cme
+sudo nano /etc/nginx/sites-available/strapi
 ```
 
 ```nginx
 server {
     listen 80;
-    server_name strapi.cmeditions.fr;
+    server_name mon-domaine.com;
 
     location / {
         proxy_pass http://localhost:1337;
@@ -267,10 +165,8 @@ server {
 }
 ```
 
-### Activer la configuration
-
 ```bash
-sudo ln -s /etc/nginx/sites-available/strapi-cme /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/strapi /etc/nginx/sites-enabled/
 sudo rm /etc/nginx/sites-enabled/default
 sudo nginx -t
 sudo systemctl restart nginx
@@ -278,39 +174,32 @@ sudo systemctl restart nginx
 
 ---
 
-## 8. Configurer le DNS
+## 9. Configurer le DNS
 
-Dans l'interface OVH, ajouter un enregistrement DNS de type `A` :
+Chez le registrar, créer un enregistrement de type `A` :
 
-- Sous-domaine : `strapi`
+- Sous-domaine : `strapi` (ou `api`, etc.)
 - Cible : IP du VPS
 - TTL : valeur par défaut
 
 ---
 
-## 9. Configurer le SSL (Let's Encrypt)
+## 10. Configurer le SSL
 
-### Ouvrir les ports 80 et 443 dans le firewall Infomaniak
-
-Dans le manager Infomaniak → Firewall du VPS → ajouter les ports 80 et 443.
+### Ouvrir les ports 80 et 443 dans le firewall du VPS
 
 ### Installer Certbot
 
 ```bash
 sudo apt install certbot python3-certbot-nginx -y
+sudo certbot --nginx -d mon-domaine.com
 ```
 
-### Générer le certificat
-
-```bash
-sudo certbot --nginx -d strapi.cmeditions.fr
-```
-
-> Certbot met à jour automatiquement la config Nginx pour rediriger HTTP → HTTPS.
+> Certbot met à jour automatiquement la config Nginx pour rediriger HTTP → HTTPS et renouvelle le certificat automatiquement.
 
 ---
 
-## 10. Configurer l'email (SMTP OVH)
+## 11. Configurer l'email (SMTP)
 
 ### Installer le provider nodemailer
 
@@ -340,17 +229,27 @@ email: {
 },
 ```
 
+### Variables .env correspondantes
+
+```env
+SMTP_HOST=smtp.mon-provider.com
+SMTP_PORT=587
+SMTP_USERNAME=adresse@domaine.com
+SMTP_PASSWORD=mot-de-passe
+SMTP_FROM=adresse@domaine.com
+```
+
 ---
 
-## 11. Mettre à jour le code sur le VPS
+## 12. Mettre à jour le code sur le VPS
 
 ```bash
-cd ~/nom-du-repo
+cd ~/repo
 git fetch origin
 git reset --hard origin/main
 npm install
 NODE_ENV=production NODE_OPTIONS="--max-old-space-size=1536" npm run build
-pm2 restart strapi-cme
+pm2 restart strapi
 ```
 
 ---
@@ -358,19 +257,18 @@ pm2 restart strapi-cme
 ## Commandes utiles
 
 ```bash
-# Voir les logs Strapi
-pm2 logs strapi-cme --lines 50
+# Logs
+pm2 logs strapi --lines 50
 
-# Statut des processus
+# Statut
 pm2 status
 
-# Redémarrer Strapi
-pm2 restart strapi-cme
+# Redémarrer
+pm2 restart strapi
 
-# Tester Nginx
+# Vérifier la config Nginx
 sudo nginx -t
 
-# Renouvellement SSL (automatique, mais si besoin manuel)
+# Renouveler le certificat SSL manuellement
 sudo certbot renew
 ```
-
