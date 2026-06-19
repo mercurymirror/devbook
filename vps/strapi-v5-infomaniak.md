@@ -1,110 +1,146 @@
-# Héberger Strapi v5 sur un VPS Linux
+# Héberger Strapi v5 sur un VPS Linux avec Docker
 
 ## Stack
 
 - **OS** : Ubuntu 24.04 LTS
-- **Runtime** : Node.js 22 LTS (via nvm)
-- **Base de données** : PostgreSQL
-- **Process manager** : PM2
+- **Runtime** : Node.js 22 LTS (dans le conteneur Docker)
+- **Base de données** : PostgreSQL 17 (dans un conteneur Docker)
+- **Orchestration** : Docker + Docker Compose
 - **Reverse proxy** : Nginx
 - **SSL** : Let's Encrypt (Certbot)
+- **CI/CD** : GitHub Actions + GitHub Container Registry (GHCR)
 
 ---
 
-## 1. Connexion au VPS
+## Architecture
 
-```bash
-ssh -i ~/.ssh/ma-cle ubuntu@IP_DU_VPS
 ```
+Internet → Nginx (port 80/443) → Conteneur Strapi (port 1337) → Conteneur PostgreSQL
+```
+
+Le build de l'image Docker se fait sur GitHub Actions, pas sur le VPS. Le VPS pull l'image déjà buildée et la lance.
 
 ---
 
-## 2. Mise à jour du système
+## Fichiers à créer dans le projet Strapi
 
-```bash
-sudo apt update && sudo apt upgrade -y
+### Dockerfile
+
+```dockerfile
+FROM node:22-alpine
+RUN apk update && apk add --no-cache build-base gcc autoconf automake zlib-dev libpng-dev bash vips-dev git
+ARG NODE_ENV=production
+ENV NODE_ENV=${NODE_ENV}
+
+WORKDIR /opt/
+COPY package.json package-lock.json ./
+RUN npm install -g node-gyp
+RUN npm config set fetch-retry-maxtimeout 600000 -g && npm ci
+ENV PATH=/opt/node_modules/.bin:$PATH
+
+WORKDIR /opt/app
+COPY . .
+RUN npm run build
+RUN chown -R node:node /opt/app
+USER node
+EXPOSE 1337
+CMD ["npm", "run", "start"]
 ```
 
----
+### docker-compose.yml (développement local)
 
-## 3. Installer nvm et Node.js
+```yaml
+services:
+  strapi:
+    container_name: strapi
+    build: .
+    image: strapi:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "1337:1337"
+    networks:
+      - strapi
+    depends_on:
+      strapiDB:
+        condition: service_healthy
 
-```bash
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/$(curl -s https://api.github.com/repos/nvm-sh/nvm/releases/latest | grep '"tag_name"' | cut -d'"' -f4)/install.sh | bash
-source ~/.bashrc
+  strapiDB:
+    container_name: strapiDB
+    restart: unless-stopped
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      POSTGRES_DB: ${DATABASE_NAME}
+    volumes:
+      - strapi-data:/var/lib/postgresql/data/
+    ports:
+      - "5432:5432"
+    networks:
+      - strapi
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-nvm install 22
-nvm alias default 22
-node --version
+volumes:
+  strapi-data:
+
+networks:
+  strapi:
+    name: strapi
+    driver: bridge
 ```
 
-> Strapi v5 supporte Node.js v20, v22 et v24 (LTS uniquement).
+### docker-compose.prod.yml (production)
 
----
+```yaml
+services:
+  strapi:
+    container_name: strapi
+    image: ghcr.io/GITHUB_USERNAME/NOM_DU_REPO:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "1337:1337"
+    networks:
+      - strapi
+    depends_on:
+      strapiDB:
+        condition: service_healthy
 
-## 4. Installer PostgreSQL
+  strapiDB:
+    container_name: strapiDB
+    restart: unless-stopped
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${DATABASE_USERNAME}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      POSTGRES_DB: ${DATABASE_NAME}
+    volumes:
+      - strapi-data:/var/lib/postgresql/data/
+    networks:
+      - strapi
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USERNAME} -d ${DATABASE_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-```bash
-sudo apt install postgresql postgresql-contrib -y
-sudo systemctl status postgresql
+volumes:
+  strapi-data:
+
+networks:
+  strapi:
+    name: strapi
+    driver: bridge
 ```
 
-### Créer un utilisateur et une base de données
+> Remplacer `GITHUB_USERNAME` et `NOM_DU_REPO` par les valeurs réelles.
 
-```bash
-sudo -u postgres psql
-```
-
-```sql
-CREATE USER mon_user WITH PASSWORD 'mot-de-passe';
-CREATE DATABASE ma_db OWNER mon_user;
-\q
-```
-
-> Éviter les caractères spéciaux dans le mot de passe — ils peuvent causer des problèmes d'échappement dans le .env.
-
----
-
-## 5. Installer PM2 et Nginx
-
-```bash
-npm install -g pm2
-sudo apt install nginx -y
-```
-
----
-
-## 6. Ajouter un swap (recommandé si RAM ≤ 2 Go)
-
-Le build Strapi est gourmand en mémoire. Un swap évite les erreurs out of memory.
-
-```bash
-sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-
-# Rendre le swap permanent
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-```
-
----
-
-## 7. Déployer Strapi
-
-### Cloner le repo
-
-```bash
-git clone https://github.com/user/repo.git
-cd repo
-npm install
-```
-
-### Configurer le .env
-
-```bash
-nano .env
-```
+### .env (variables importantes)
 
 ```env
 HOST=0.0.0.0
@@ -116,36 +152,148 @@ TRANSFER_TOKEN_SALT=...
 JWT_SECRET=...
 
 DATABASE_CLIENT=postgres
-DATABASE_HOST=127.0.0.1
+DATABASE_HOST=strapiDB  # Nom du conteneur PostgreSQL, pas 127.0.0.1
 DATABASE_PORT=5432
-DATABASE_NAME=ma_db
-DATABASE_USERNAME=mon_user
+DATABASE_NAME=strapi_cme
+DATABASE_USERNAME=strapi
 DATABASE_PASSWORD=mot-de-passe
+
+CLOUDINARY_NAME=...
+CLOUDINARY_API_KEY=...
+CLOUDINARY_API_SECRET=...
+
+SMTP_HOST=smtp.mon-provider.com
+SMTP_PORT=587
+SMTP_USERNAME=adresse@domaine.com
+SMTP_PASSWORD=mot-de-passe
+SMTP_FROM=adresse@domaine.com
 ```
 
-> Les valeurs APP_KEYS, secrets et salts se trouvent dans le .env local du projet.
+> `DATABASE_HOST` doit être le nom du service PostgreSQL dans docker-compose, pas `127.0.0.1`.
 
-### Builder Strapi
+---
 
-```bash
-NODE_ENV=production NODE_OPTIONS="--max-old-space-size=1536" npm run build
+## Workflow GitHub Actions
+
+```yaml
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/GITHUB_USERNAME/NOM_DU_REPO:latest
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ~/NOM_DU_REPO
+            git pull origin main
+            docker pull ghcr.io/GITHUB_USERNAME/NOM_DU_REPO:latest
+            docker compose -f docker-compose.prod.yml up -d
 ```
 
-> Le build peut prendre plusieurs minutes sur un petit VPS.
+### Secrets GitHub à configurer
 
-### Démarrer avec PM2
+Dans le repo GitHub → Settings → Secrets and variables → Actions :
+
+- `VPS_SSH_KEY` : clé SSH privée dédiée au déploiement
+- `VPS_HOST` : IP du VPS
+- `VPS_USER` : `ubuntu`
+
+> `GITHUB_TOKEN` est automatique — pas besoin de le créer.
+
+---
+
+## 1. Provisionner le VPS
+
+### Connexion SSH
 
 ```bash
-NODE_ENV=production pm2 start npm --name "strapi" -- start
-pm2 startup
-pm2 save
+ssh -i ~/.ssh/ma-cle ubuntu@IP_DU_VPS
+```
+
+### Mise à jour du système
+
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+### Installer Docker
+
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo apt install docker-compose-plugin -y
+sudo usermod -aG docker ubuntu
+newgrp docker
+```
+
+Vérifier que Docker démarre au boot :
+
+```bash
+sudo systemctl is-enabled docker
 ```
 
 ---
 
-## 8. Configurer Nginx comme reverse proxy
+## 2. Déployer Strapi
+
+### Cloner le repo
 
 ```bash
+git clone https://github.com/GITHUB_USERNAME/NOM_DU_REPO.git
+cd NOM_DU_REPO
+```
+
+### Configurer le .env sur le VPS
+
+```bash
+nano .env
+```
+
+> Ne pas oublier `DATABASE_HOST=strapiDB` (nom du conteneur, pas `127.0.0.1`).
+
+### Premier déploiement manuel
+
+```bash
+docker compose -f docker-compose.prod.yml up -d
+```
+
+---
+
+## 3. Configurer Nginx
+
+```bash
+sudo apt install nginx -y
 sudo nano /etc/nginx/sites-available/strapi
 ```
 
@@ -174,7 +322,7 @@ sudo systemctl restart nginx
 
 ---
 
-## 9. Configurer le DNS
+## 4. Configurer le DNS
 
 Chez le registrar, créer un enregistrement de type `A` :
 
@@ -184,72 +332,30 @@ Chez le registrar, créer un enregistrement de type `A` :
 
 ---
 
-## 10. Configurer le SSL
+## 5. Configurer le SSL
 
-### Ouvrir les ports 80 et 443 dans le firewall du VPS
-
-### Installer Certbot
+Ouvrir les ports 80 et 443 dans le firewall du VPS, puis :
 
 ```bash
 sudo apt install certbot python3-certbot-nginx -y
 sudo certbot --nginx -d mon-domaine.com
 ```
 
-> Certbot met à jour automatiquement la config Nginx pour rediriger HTTP → HTTPS et renouvelle le certificat automatiquement.
-
 ---
 
-## 11. Configurer l'email (SMTP)
+## 6. Migrer les données PostgreSQL
 
-### Installer le provider nodemailer
-
-```bash
-npm install @strapi/provider-email-nodemailer
-```
-
-### Configurer dans config/plugins.ts
-
-```typescript
-email: {
-  config: {
-    provider: 'nodemailer',
-    providerOptions: {
-      host: env('SMTP_HOST'),
-      port: env('SMTP_PORT'),
-      auth: {
-        user: env('SMTP_USERNAME'),
-        pass: env('SMTP_PASSWORD'),
-      },
-    },
-    settings: {
-      defaultFrom: env('SMTP_FROM'),
-      defaultReplyTo: env('SMTP_FROM'),
-    },
-  },
-},
-```
-
-### Variables .env correspondantes
-
-```env
-SMTP_HOST=smtp.mon-provider.com
-SMTP_PORT=587
-SMTP_USERNAME=adresse@domaine.com
-SMTP_PASSWORD=mot-de-passe
-SMTP_FROM=adresse@domaine.com
-```
-
----
-
-## 12. Mettre à jour le code sur le VPS
+Si une base de données existante doit être migrée vers le conteneur Docker :
 
 ```bash
-cd ~/repo
-git fetch origin
-git reset --hard origin/main
-npm install
-NODE_ENV=production NODE_OPTIONS="--max-old-space-size=1536" npm run build
-pm2 restart strapi
+# Dump de l'ancienne base
+pg_dump -U strapi -h 127.0.0.1 -d strapi_cme -F c -f /tmp/strapi_backup.dump
+
+# Vider la base Docker (Strapi crée ses tables au premier démarrage)
+docker exec -i strapiDB psql -U strapi -d strapi_cme -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+
+# Restaurer le dump dans le conteneur
+cat /tmp/strapi_backup.dump | docker exec -i strapiDB pg_restore -U strapi -d strapi_cme -F c
 ```
 
 ---
@@ -257,14 +363,20 @@ pm2 restart strapi
 ## Commandes utiles
 
 ```bash
-# Logs
-pm2 logs strapi --lines 50
+# Voir les conteneurs en cours
+docker ps
 
-# Statut
-pm2 status
+# Logs Strapi
+docker logs strapi
 
-# Redémarrer
-pm2 restart strapi
+# Logs PostgreSQL
+docker logs strapiDB
+
+# Redémarrer les conteneurs
+docker compose -f docker-compose.prod.yml restart
+
+# Arrêter les conteneurs
+docker compose -f docker-compose.prod.yml down
 
 # Vérifier la config Nginx
 sudo nginx -t
@@ -272,94 +384,3 @@ sudo nginx -t
 # Renouveler le certificat SSL manuellement
 sudo certbot renew
 ```
-
-## 13. CI/CD avec GitHub Actions
- 
-Le build se fait sur les runners GitHub (pas sur le VPS) pour éviter les problèmes de mémoire.
- 
-### Créer une clé SSH dédiée
- 
-Sur la machine locale :
- 
-```bash
-ssh-keygen -t ed25519 -f ~/.ssh/id_github_actions -C "github-actions" -N ""
-```
- 
-Ajouter la clé publique au VPS :
- 
-```bash
-cat ~/.ssh/id_github_actions.pub
-# Puis sur le VPS :
-echo "la-clé-publique" >> ~/.ssh/authorized_keys
-```
- 
-### Ajouter les secrets GitHub
- 
-Dans le repo GitHub → Settings → Secrets and variables → Actions, ajouter :
- 
-- `VPS_SSH_KEY` : contenu complet de `~/.ssh/id_github_actions` (clé privée)
-- `VPS_HOST` : IP du VPS
-- `VPS_USER` : `ubuntu`
-- `APP_KEYS` : valeur du .env local
-- `API_TOKEN_SALT` : valeur du .env local
-- `ADMIN_JWT_SECRET` : valeur du .env local
-- `TRANSFER_TOKEN_SALT` : valeur du .env local
-- `JWT_SECRET` : valeur du .env local
-### Créer le workflow
- 
-```bash
-mkdir -p .github/workflows
-nano .github/workflows/deploy.yml
-```
- 
-```yaml
-name: Deploy to VPS
- 
-on:
-  push:
-    branches:
-      - main
- 
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
- 
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
- 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
- 
-      - name: Install dependencies
-        run: npm install
- 
-      - name: Build Strapi
-        run: npm run build
-        env:
-          NODE_ENV: production
-          APP_KEYS: ${{ secrets.APP_KEYS }}
-          API_TOKEN_SALT: ${{ secrets.API_TOKEN_SALT }}
-          ADMIN_JWT_SECRET: ${{ secrets.ADMIN_JWT_SECRET }}
-          TRANSFER_TOKEN_SALT: ${{ secrets.TRANSFER_TOKEN_SALT }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
- 
-      - name: Deploy to VPS
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-            cd ~/nom-du-repo
-            git pull origin main
-            npm install --production
-            pm2 restart strapi
-```
- 
-> Le build se fait sur la machine GitHub — le VPS ne fait que récupérer le code et redémarrer PM2.
-> nvm doit être chargé explicitement dans le script SSH car la session est non-interactive.
